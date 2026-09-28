@@ -36,6 +36,8 @@ struct TextAreaLine {
   bool hardBreak;
 };
 
+inline constexpr uint16_t TEXT_AREA_LINE_BYTES = 220;
+
 // Walks `text` wrapped to `width`, calling emit(index, TextAreaLine) for each
 // visual line in order; returns the total visual-line count. Empty text yields
 // one empty line; a trailing '\n' yields a final empty line (so the caret has a
@@ -48,7 +50,7 @@ inline uint32_t textAreaWalk(const DrawTarget& target, int16_t width, const char
   if (width < 1) width = 1;
   char buf[224];
   const auto fits = [&](uint32_t start, uint32_t len) -> bool {
-    uint32_t n = len < 220 ? len : 220;
+    const uint32_t n = len;
     memcpy(buf, text + start, n);
     buf[n] = '\0';
     return target.measureText(style.font, buf, style).width <= width;
@@ -60,13 +62,17 @@ inline uint32_t textAreaWalk(const DrawTarget& target, int16_t width, const char
     uint32_t lastBreak = lineStart;  // byte after the last fitting space
     bool haveBreak = false;
     while (text[i] != '\0' && text[i] != '\n') {
-      const uint32_t candidate = i + 1 - lineStart;
-      if (candidate > 1 && !fits(lineStart, candidate)) break;  // would overflow
+      uint32_t next = i + 1;
+      while (next - i < 4 && (text[next] & 0xC0) == 0x80) ++next;
+      const uint32_t candidate = next - lineStart;
+      // The measured span is the complete span the renderer will draw. Even
+      // zero-width marks must wrap before exhausting its byte buffer.
+      if (candidate > TEXT_AREA_LINE_BYTES || (i > lineStart && !fits(lineStart, candidate))) break;
       if (text[i] == ' ') {
-        lastBreak = i + 1;
+        lastBreak = next;
         haveBreak = true;
       }
-      ++i;
+      i = next;
     }
     uint32_t lineEnd;
     uint32_t nextStart;
@@ -82,7 +88,7 @@ inline uint32_t textAreaWalk(const DrawTarget& target, int16_t width, const char
       lineEnd = lastBreak;  // soft wrap after a space
       nextStart = lastBreak;
     } else {
-      uint32_t brk = i > lineStart ? i : lineStart + 1;  // word wider than rect: char break
+      uint32_t brk = i > lineStart ? i : lineStart + 1;                 // word wider than rect: char break
       while (brk > lineStart + 1 && (text[brk] & 0xC0) == 0x80) --brk;  // keep codepoints whole
       lineEnd = brk;
       nextStart = brk;
@@ -159,7 +165,7 @@ void textArea(Frame<MaxInteractions>& frame, Rect rect, const TextAreaProps& pro
   textAreaWalk(t, rect.width, text, props.style, [&](uint32_t idx, const TextAreaLine& ln) {
     if (idx < top || idx >= top + visible) return;
     const int16_t y = static_cast<int16_t>(rect.y + (idx - top) * lh);
-    uint16_t n = ln.len < 220 ? ln.len : 220;
+    const uint16_t n = ln.len;
     const uint32_t lineEnd = ln.start + ln.len;
 
     // Selection band behind the text. Dithered so 1-bit glyphs stay readable.

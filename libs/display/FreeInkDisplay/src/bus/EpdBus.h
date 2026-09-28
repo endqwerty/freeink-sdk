@@ -54,19 +54,23 @@ class EpdBus {
   // Grouped transaction primitives (used by multi-step sequences, e.g. M5).
   void beginTxn();
   void endTxn();
-  void rawCmd(uint8_t c);                            // assumes a transaction is open
-  void rawData(uint8_t d);                           // assumes a transaction is open
+  void rawCmd(uint8_t c);                              // assumes a transaction is open
+  void rawData(uint8_t d);                             // assumes a transaction is open
   void rawWriteBytes(const uint8_t* d, uint16_t len);  // bulk data, transaction open
 
-  // Wait for a refresh/operation to finish using the configured (or given) polarity.
-  void waitBusy(const char* tag = nullptr);
-  void waitBusy(BusyPolarity p, const char* tag = nullptr);
+  // Wait using the configured (or given) polarity. False latches a timeout;
+  // later writes remain blocked until reset() succeeds.
+  bool waitBusy(const char* tag = nullptr);
+  bool waitBusy(BusyPolarity p, const char* tag = nullptr);
 
   // Like waitBusy(), but sleeps the calling task on a BUSY-edge interrupt and
   // wakes exactly on the completion edge instead of polling every 1 ms. For the
-  // refresh-completion wait: it confirms the waveform is running (short bounded
-  // poll) before arming, so it is safe to call right after firing the refresh.
-  void waitRefreshComplete(const char* tag = nullptr);
+  // refresh-completion wait: assertion may be delayed after activation, so both
+  // interrupt and polling paths allow a bounded assertion grace period.
+  bool waitRefreshComplete(const char* tag = nullptr);
+
+  // A timed-out operation blocks SPI until reset() re-establishes an idle controller.
+  bool hasFailed() const { return _failed; }
 
   // Instantaneous BUSY-pin read for non-blocking refresh polling. The UC/X3
   // active-low conventions both terminate HIGH, so LOW reports busy.
@@ -133,6 +137,9 @@ class EpdBus {
   BusyPolarity _busy = BusyPolarity::ActiveHigh;
   uint32_t _spiHz = 40000000;
   int8_t _coCs = -1;
+  bool _failed = false;
+  bool _transactionOpen = false;
+  bool finishWait(bool complete, const char* tag, unsigned long start);
 };
 
 }  // namespace freeink

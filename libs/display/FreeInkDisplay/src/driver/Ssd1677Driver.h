@@ -88,6 +88,8 @@ class Ssd1677Driver : public PanelDriver {
   PanelGeometry geometry() const override;
 
   void begin(EpdBus& bus) override;
+  void beginDisplayWork() override { _displayCommitted = false; }
+  bool displayCommitted() const override { return _displayCommitted; }
   void deepSleep(EpdBus& bus) override;
   void powerOffBetweenFrames(EpdBus& bus) override;
 
@@ -102,7 +104,10 @@ class Ssd1677Driver : public PanelDriver {
   void displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y, uint16_t w,
                      uint16_t h, bool turnOff) override;
 
-  void requestResync(uint8_t) override { _needsGrayClear = true; _absoluteInput = false; }
+  void requestResync(uint8_t) override {
+    _needsGrayClear = true;
+    _absoluteInput = false;
+  }
   void beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback, bool turnOff) override;
 
   void seedPreviousFrame(EpdBus& bus, const uint8_t* buf) override;
@@ -126,6 +131,8 @@ class Ssd1677Driver : public PanelDriver {
   void setCustomLut(EpdBus& bus, bool enabled, const unsigned char* data) override;
 
  private:
+  bool checkBus(EpdBus& bus);
+  bool _displayCommitted = false;
   bool _pendingFrameSync = false;
   bool _needsGrayClear = false;
   bool _absoluteInput = false;
@@ -134,12 +141,12 @@ class Ssd1677Driver : public PanelDriver {
   void setRamArea(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
   void writeRam(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, uint32_t size);
   // async: fire MASTER_ACTIVATION and return without waiting on BUSY.
-  void refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool async = false);
+  bool refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool async = false);
   // Blocking CLOCK_ON|ANALOG_ON activation; no-op when already powered.
-  void powerOn(EpdBus& bus);
+  bool powerOn(EpdBus& bus);
   // Documented SSD1677 analog/oscillator shutdown. Used after a 0xFC update
   // when turnOff was requested and by deepSleep().
-  void powerOffController(EpdBus& bus, uint16_t settleMs = 200);
+  bool powerOffController(EpdBus& bus, uint16_t settleMs = 200);
   void displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff, bool async);
 
   const Ssd1677Config& _cfg;

@@ -63,6 +63,10 @@ int main(int argc, char** argv) {
   bus.waitBusy();
   assert(millis() > 30000 && millis() <= 30011);
   assert(begins == 1 && ends == 1);
+  // A timed-out wait latches the bus failure until the controller is reset.
+  assert(bus.hasFailed());
+  bus.reset();
+  assert(!bus.hasFailed());
 
   // Refresh assertion is deliberately later than the command settling guard.
   // ISR, hooked polling, and semaphore-allocation fallback must all wait for it.
@@ -75,6 +79,8 @@ int main(int argc, char** argv) {
   bus.waitRefreshComplete();
   assert(millis() >= 30000 && millis() <= 30010);
   assert(begins == 1 && ends == 1 && isr == nullptr);
+  assert(bus.hasFailed());
+  bus.reset();
   schedule(0, 0);
   bus.waitRefreshComplete();
   assert(millis() == (hooked || fallback ? 100 : 20));

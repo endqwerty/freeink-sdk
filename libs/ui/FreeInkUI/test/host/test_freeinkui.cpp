@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <string>
 #include <thread>
 
 namespace {
@@ -5301,6 +5302,36 @@ void testTextArea() {
   CHECK(sawCaret);       // caret on the now-visible line 1
 }
 
+// Every byte must remain reachable, even when width does not constrain a line.
+void testTextAreaBoundedUtf8Spans() {
+  FakeDrawTarget draw;
+  const TextStyle style{};
+  for (const auto& text : {std::string(1000, 'a'), std::string(219, 'a') + "é中😀tail"}) {
+    uint32_t consumed = 0;
+    const auto count = textAreaWalk(draw, 32000, text.c_str(), style, [&](uint32_t, const TextAreaLine& line) {
+      CHECK_EQ(line.start, consumed);
+      CHECK(line.len <= TEXT_AREA_LINE_BYTES);
+      CHECK(line.len > 0);
+      CHECK((static_cast<unsigned char>(text[line.start]) & 0xC0) != 0x80);
+      consumed += line.len;
+      CHECK(consumed == text.size() || (static_cast<unsigned char>(text[consumed]) & 0xC0) != 0x80);
+    });
+    CHECK(count > 1);
+    CHECK_EQ(consumed, text.size());
+  }
+  // A glyph wider than the viewport still advances by its whole encoding.
+  const char* text = "é中😀";
+  uint32_t consumed = 0;
+  CHECK_EQ(textAreaWalk(draw, 1, text, style,
+                        [&](uint32_t, const TextAreaLine& line) {
+                          CHECK_EQ(line.start, consumed);
+                          CHECK(line.len >= 2 && line.len <= 4);
+                          consumed += line.len;
+                        }),
+           3u);
+  CHECK_EQ(consumed, std::strlen(text));
+}
+
 // Filled-capsule slider: one track fill, a value-proportional stadium fill,
 // an outline, and a round handle riding the fill boundary — and a drag-routed
 // hit over the whole pill.
@@ -6094,6 +6125,7 @@ int main() {
   testFreeInkAppHandlerOverflowFlag();
   testFreeInkAppSharedThemeRefFollowsAtomicSwap();
   testTextArea();
+  testTextAreaBoundedUtf8Spans();
   testCapsuleSlider();
   testSliderRow();
   testPublicationPage();

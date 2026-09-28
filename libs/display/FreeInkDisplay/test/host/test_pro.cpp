@@ -295,6 +295,13 @@ static void testCapabilities() {
     assert(display.grayscaleCapabilities(GrayscaleMode::Absolute).supported());
     assert(!display.grayscaleCapabilities(GrayscaleMode::Absolute).stripUploads);
   }
+  const auto variant = BoardConfig::ACTIVE.displayControllerVariant;
+  BoardConfig::ACTIVE.displayControllerVariant = 0x67;
+  for (auto mode : {GrayscaleMode::Overlay, GrayscaleMode::Absolute, GrayscaleMode::Direct}) {
+    assert(!display.grayscaleCapabilities(mode).supported());
+    assert(!display.displayGrayscaleBase(mode));
+  }
+  BoardConfig::ACTIVE.displayControllerVariant = variant;
   // Queries must neither start a refresh nor write the panel bus.
   assert(display._bus.writes.empty() && !display.isRefreshPending());
 }
@@ -483,6 +490,7 @@ static void testUc8179GrayShadeSplit() {
     expected[3] = 2;
     assert(dark->bytes == expected);
     std::vector<size_t> pllWrites;
+    pllWrites.reserve(2);
     size_t refresh = bus.writes.size();
     for (size_t i = 0; i < bus.writes.size(); ++i) {
       if (bus.writes[i].command == 0x30 && bus.writes[i].bytes.size() == 1) pllWrites.push_back(i);
@@ -523,6 +531,21 @@ static void testDirectSleep() {
     display.cleanupGrayscaleBuffers(bw.data());
     display.displayBuffer(FreeInkDisplay::FAST_REFRESH, false);
     assert(activations() > 1);
+  }
+  for (bool turnOff : {false, true}) {
+    std::memcpy(display.getFrameBuffer(), bw.data(), bw.size());
+    auto* const canvas = display.getFrameBuffer();
+    display._bus.clear();
+    assert(display.displayGrayscaleBase(GrayscaleMode::Direct, FreeInkDisplay::FULL_REFRESH, turnOff));
+    assert(display.getFrameBuffer() == canvas);
+    assert(std::memcmp(display.getFrameBuffer(), bw.data(), bw.size()) == 0);
+    const auto cleanupActivations = activations();
+    assert(cleanupActivations > 0);
+    display.copyGrayscaleBuffers(lsb.data(), msb.data());
+    assert(activations() == cleanupActivations);
+    display.displayGrayBuffer(turnOff);
+    assert(activations() == cleanupActivations + 1);
+    display.cleanupGrayscaleBuffers(bw.data());
   }
   display._bus.clear();
   assert(display.displayGrayscaleBase(GrayscaleMode::Direct));

@@ -133,6 +133,9 @@ class EpdBus {
    private:
     EpdBus* _bus = nullptr;
     SpiApbLockGuard _pmLock;
+    // False once ended, or after a BUSY timeout latched the bus failure.
+    bool writable() const;
+
     bool _active = false;
   };
 
@@ -156,15 +159,19 @@ class EpdBus {
   // Scoped SPI/APB transaction that selects the panel and de-selects it on exit.
   [[nodiscard]] Transaction beginTxn();
 
-  // Wait for a refresh/operation to finish using the configured (or given) polarity.
-  void waitBusy(const char* tag = nullptr);
-  void waitBusy(BusyPolarity p, const char* tag = nullptr);
+  // Wait using the configured (or given) polarity. False latches a timeout;
+  // later writes remain blocked until reset() succeeds.
+  bool waitBusy(const char* tag = nullptr);
+  bool waitBusy(BusyPolarity p, const char* tag = nullptr);
 
   // Like waitBusy(), but sleeps the calling task on a BUSY-edge interrupt and
   // wakes exactly on the completion edge instead of polling every 1 ms. For the
-  // refresh-completion wait: it confirms the waveform is running (short bounded
-  // poll) before arming, so it is safe to call right after firing the refresh.
-  void waitRefreshComplete(const char* tag = nullptr);
+  // refresh-completion wait: assertion may be delayed after activation, so both
+  // interrupt and polling paths allow a bounded assertion grace period.
+  bool waitRefreshComplete(const char* tag = nullptr);
+
+  // A timed-out operation blocks SPI until reset() re-establishes an idle controller.
+  bool hasFailed() const { return _failed; }
 
   // Instantaneous BUSY-pin read for non-blocking refresh polling. The UC/X3
   // active-low conventions both terminate HIGH, so LOW reports busy.
@@ -234,6 +241,8 @@ class EpdBus {
   BusyPolarity _busy = BusyPolarity::ActiveHigh;
   uint32_t _spiHz = 20000000;
   int8_t _coCs = -1;
+  bool _failed = false;
+  bool finishWait(bool complete, const char* tag, unsigned long start);
 };
 
 }  // namespace freeink

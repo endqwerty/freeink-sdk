@@ -294,6 +294,7 @@ void FreeInkDisplay::begin() {
 #endif
 
   _driver->begin(_bus);
+  handleBusFailure();
 }
 
 // ============================================================================
@@ -613,13 +614,40 @@ bool FreeInkDisplay::returnSecondaryBuffer() {
 // Panel operations (delegated to the active driver)
 // ============================================================================
 
+bool FreeInkDisplay::handleBusFailure() {
+  if (!_bus.hasFailed()) return false;
+  _refreshPending = false;
+#ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  _pendingSingleBufferFrame = nullptr;
+#else
+  _redBaselineAuthoritative = false;
+#endif
+  _shadowValid = false;
+  _redRamSynced = false;
+  _inversionDirty = true;
+  _grayscaleMode = GrayscaleMode::Overlay;
+  _grayRows[0] = _grayRows[1] = 0;
+  _grayPassFailed = true;
+  return true;
+}
+
+bool FreeInkDisplay::prepareDisplay() {
+  if (!_bus.hasFailed()) return true;
+  handleBusFailure();
+  // Retry only at a new full-frame submission. Plane cleanup and deferred
+  // completion must never restart an interrupted controller sequence.
+  DisplayPmLock pmLock;
+  _driver->begin(_bus);
+  return !handleBusFailure();
+}
+
 void FreeInkDisplay::syncPendingAsync() {
   // Single pending state: any deferred refresh — X4 async fire or X3 split —
   // completes through the driver's displayFinish(), which waits out the
   // waveform (ISR edge wait, done-level fast path) and runs any post-waveform
   // pipeline (X3 DTM1 sync + conditioning). A plain waitBusy would skip that
   // and leave the controller mid-pipeline.
-  if (!_refreshPending) return;
+  if (handleBusFailure() || !_refreshPending) return;
   DisplayPmLock pmLock;
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   _driver->displayFinish(_bus, _pendingSingleBufferFrame);
@@ -628,6 +656,7 @@ void FreeInkDisplay::syncPendingAsync() {
   _driver->displayFinish(_bus, frameBufferActive ? frameBufferActive : frameBuffer);
 #endif
   _refreshPending = false;
+  handleBusFailure();
 }
 
 bool FreeInkDisplay::supportsAsyncRefresh() const {
@@ -654,6 +683,7 @@ bool FreeInkDisplay::refreshBusy() {
 }
 
 void FreeInkDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
+  if (!prepareDisplay()) return;
   cancelGrayscalePass();
   _grayPassFailed = false;
   DisplayPmLock pmLock;
@@ -661,6 +691,7 @@ void FreeInkDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
   Serial.printf("[EPD] displayBuffer mode=%d off=%d\n", (int)mode, (int)turnOffScreen);
 #endif
   syncPendingAsync();
+  if (handleBusFailure()) return;
   if (_inversionDirty && mode == FAST_REFRESH) {
     mode = HALF_REFRESH;
   }
@@ -684,8 +715,10 @@ void FreeInkDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
     invertBytes(next, bufferSize);
     invertBytes(const_cast<uint8_t*>(prev), bufferSize);
   }
+  if (handleBusFailure()) return;
   swapBuffers();
 #endif
+  if (handleBusFailure()) return;
   _inversionDirty = false;
   // X4 re-seeds RED from the displayed frame inside display(); X3 has no RED plane.
   if (_panelSel != PanelSel::X3) _redRamSynced = true;
@@ -694,6 +727,7 @@ void FreeInkDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
 void FreeInkDisplay::displayBufferAsync(RefreshMode mode) { displayAsyncImpl(mode, /*turnOffScreen=*/false); }
 
 void FreeInkDisplay::displayAsyncImpl(RefreshMode mode, bool turnOffScreen, bool noShadow) {
+  if (!prepareDisplay()) return;
   cancelGrayscalePass();
   _grayPassFailed = false;
   // Keeping the host framebuffer logical is the core inversion contract.
@@ -712,6 +746,7 @@ void FreeInkDisplay::displayAsyncImpl(RefreshMode mode, bool turnOffScreen, bool
   }
   DisplayPmLock pmLock;
   syncPendingAsync();
+  if (handleBusFailure()) return;
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   if (noShadow) {
     // Shadow-free contract: the caller keeps the framebuffer untouched until
@@ -719,6 +754,7 @@ void FreeInkDisplay::displayAsyncImpl(RefreshMode mode, bool turnOffScreen, bool
     // (e.g. the tiled-grayscale cleanup), so controller RAM stays the
     // baseline (prev = nullptr) and no 48 KB shadow is allocated.
     _refreshPending = _driver->displayStart(_bus, frameBuffer, nullptr, toInternal(mode), turnOffScreen);
+    if (handleBusFailure()) return;
     _pendingSingleBufferFrame = frameBuffer;
     _shadowValid = false;
     return;
@@ -744,6 +780,7 @@ void FreeInkDisplay::displayAsyncImpl(RefreshMode mode, bool turnOffScreen, bool
   // from then on the shadow supplies the baseline on every update.
   _refreshPending =
       _driver->displayStart(_bus, frameBuffer, _shadowValid ? _asyncShadow : nullptr, toInternal(mode), turnOffScreen);
+  if (handleBusFailure()) return;
   memcpy(_asyncShadow, frameBuffer, bufferSize);
   _pendingSingleBufferFrame = _asyncShadow;
   _shadowValid = true;
@@ -755,6 +792,7 @@ void FreeInkDisplay::displayAsyncImpl(RefreshMode mode, bool turnOffScreen, bool
   // simply keeps that baseline until the next update rewrites it.
   _refreshPending =
       _driver->displayStart(_bus, frameBuffer, consumePrevFrameFor(effMode), toInternal(effMode), turnOffScreen);
+  if (handleBusFailure()) return;
   swapBuffers();
 #endif
 }
@@ -764,6 +802,7 @@ void FreeInkDisplay::displayAsyncImpl(RefreshMode mode, bool turnOffScreen, bool
 // ============================================================================
 
 void FreeInkDisplay::triggerDisplay(RefreshMode mode, bool turnOffScreen) {
+  if (!prepareDisplay()) return;
   cancelGrayscalePass();
   _grayPassFailed = false;
   if (_inverted || _inversionDirty) {
@@ -772,8 +811,10 @@ void FreeInkDisplay::triggerDisplay(RefreshMode mode, bool turnOffScreen) {
   }
   DisplayPmLock pmLock;
   syncPendingAsync();  // finish any prior split/async refresh before starting another
+  if (handleBusFailure()) return;
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   const bool deferred = _driver->displayStart(_bus, frameBuffer, nullptr, toInternal(mode), turnOffScreen);
+  if (handleBusFailure()) return;
   _pendingSingleBufferFrame = frameBuffer;
   _shadowValid = false;
 #else
@@ -783,6 +824,7 @@ void FreeInkDisplay::triggerDisplay(RefreshMode mode, bool turnOffScreen) {
   const RefreshMode effMode = resolveReleasedMode(mode);
   const bool deferred =
       _driver->displayStart(_bus, frameBuffer, consumePrevFrameFor(effMode), toInternal(effMode), turnOffScreen);
+  if (handleBusFailure()) return;
   swapBuffers();
 #endif
   _refreshPending = deferred;
@@ -812,6 +854,8 @@ void FreeInkDisplay::finishDisplayAsync() { syncPendingAsync(); }
 void FreeInkDisplay::completeDisplay() { syncPendingAsync(); }
 
 void FreeInkDisplay::syncRedRamFromFrameBuffer() {
+  syncPendingAsync();
+  if (handleBusFailure()) return;
   // X3 has no host-managed previous-frame plane (its baseline lives in DTM1); the
   // advisory flag is meaningless there.
   if (_panelSel == PanelSel::X3) return;
@@ -831,7 +875,6 @@ void FreeInkDisplay::syncRedRamFromFrameBuffer() {
   // seed the reader does before an indexing/build release. Only the release sites call
   // this; the normal per-page path relies on the driver's own `prev` write, so this adds
   // no per-refresh SPI cost.
-  syncPendingAsync();  // never touch RED while a waveform is still reading it
   const uint8_t* onScreen = frameBufferActive ? frameBufferActive : frameBuffer;
   if (onScreen) {
     if (_inverted) invertBytes(const_cast<uint8_t*>(onScreen), bufferSize);
@@ -865,12 +908,14 @@ void FreeInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t 
     return;
   }
   syncPendingAsync();
+  if (handleBusFailure()) return;
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
   _driver->displayWindow(_bus, frameBuffer, nullptr, x, y, w, h, turnOffScreen);
   _shadowValid = false;
 #else
   _driver->displayWindow(_bus, frameBuffer, frameBufferActive, x, y, w, h, turnOffScreen);
 #endif
+  handleBusFailure();
 }
 
 void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* lut, bool factoryMode) {
@@ -882,6 +927,7 @@ void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* 
   if (_inverted) return;
   DisplayPmLock pmLock;
   syncPendingAsync();
+  if (handleBusFailure()) return;
   _shadowValid = false;
   _redRamSynced = false;  // grayscale leaves RED holding a gray plane, not the BW baseline
   if (_grayPassFailed) return;
@@ -891,11 +937,13 @@ void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* 
       return;
     }
     _driver->displayGray(_bus, frameBuffer, turnOffScreen, nullptr, true);
+    if (handleBusFailure()) return;
     _inversionDirty = false;
     cancelGrayscalePass();
     return;
   }
   _driver->displayGray(_bus, frameBuffer, turnOffScreen, lut, factoryMode);
+  handleBusFailure();
 }
 
 void FreeInkDisplay::displayGrayCalibration(uint16_t customX, uint16_t customY, uint16_t customW, uint16_t customH) {
@@ -929,10 +977,11 @@ void FreeInkDisplay::cancelGrayscalePass() {
 }
 
 bool FreeInkDisplay::acceptGrayscaleRows(unsigned plane, const uint8_t* data, uint16_t y, uint16_t rows) {
+  if (handleBusFailure()) return false;
   if (_grayscaleMode == GrayscaleMode::Overlay) return true;
   const auto h = getDisplayHeight();
-  if (_grayPassFailed || !data || !rows || (plane == 1 && _grayRows[0] == 0) ||
-      y != _grayRows[plane] || y >= h || rows > h - y) {
+  if (_grayPassFailed || !data || !rows || (plane == 1 && _grayRows[0] == 0) || y != _grayRows[plane] || y >= h ||
+      rows > h - y) {
     _grayPassFailed = true;
     return false;
   }
@@ -941,22 +990,36 @@ bool FreeInkDisplay::acceptGrayscaleRows(unsigned plane, const uint8_t* data, ui
 }
 
 bool FreeInkDisplay::displayGrayscaleBase(GrayscaleMode mode, RefreshMode fallback, bool turnOffScreen) {
+  if (!prepareDisplay()) return false;
   cancelGrayscalePass();
   const auto caps = grayscaleCapabilities(mode);
   if (!caps.supported()) return false;
-  if (_inversionDirty && (mode == GrayscaleMode::Overlay || caps.base == GrayscaleBase::Separate))
-    displayBuffer(fallback, turnOffScreen);
   DisplayPmLock pmLock;
+  // Cleanup must preserve the canvas used by the following grayscale base and
+  // plane composition, including when recovering a failed submission.
+  const bool polarityCleanup =
+      _inversionDirty && (mode == GrayscaleMode::Overlay || caps.base == GrayscaleBase::Separate);
+  if ((mode == GrayscaleMode::Direct && fallback == FULL_REFRESH) || polarityCleanup) {
+    syncPendingAsync();
+    if (handleBusFailure()) return false;
+    const RefreshMode cleanupMode = fallback == FAST_REFRESH ? HALF_REFRESH : fallback;
+    _driver->display(_bus, frameBuffer, nullptr, toInternal(cleanupMode), turnOffScreen);
+    if (handleBusFailure()) return false;
+    _inversionDirty = false;
+  }
   syncPendingAsync();
+  if (handleBusFailure()) return false;
   _shadowValid = false;
   _grayPassFailed = false;
   _driver->beginGrayscale(_bus, frameBuffer, mode, toInternal(fallback), turnOffScreen);
+  if (handleBusFailure()) return false;
   _grayscaleMode = mode;
   _grayRows[0] = _grayRows[1] = 0;
   return true;
 }
 
 void FreeInkDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScreen) {
+  if (!prepareDisplay()) return;
   cancelGrayscalePass();
   _grayPassFailed = false;
   if (_inverted || _inversionDirty) {
@@ -965,8 +1028,10 @@ void FreeInkDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScre
   }
   DisplayPmLock pmLock;
   syncPendingAsync();
+  if (handleBusFailure()) return;
   _shadowValid = false;
   _driver->beginGrayscale(_bus, frameBuffer, GrayscaleMode::Overlay, toInternal(fallback), turnOffScreen);
+  handleBusFailure();
 }
 
 void FreeInkDisplay::preconditionGrayscale() {
@@ -1011,9 +1076,7 @@ void FreeInkDisplay::writeGrayscalePlaneStrip(GrayPlane plane, const uint8_t* ro
                                     rows, yStart, numRows);
 }
 
-bool FreeInkDisplay::supportsBusyGrayscaleStaging() const {
-  return grayscaleCapabilities().stagingWhileBusy;
-}
+bool FreeInkDisplay::supportsBusyGrayscaleStaging() const { return grayscaleCapabilities().stagingWhileBusy; }
 
 void FreeInkDisplay::prepareGrayscaleTarget() {
   if (grayscaleCapabilities().stagingWhileBusy) {
@@ -1021,13 +1084,9 @@ void FreeInkDisplay::prepareGrayscaleTarget() {
   }
 }
 
-bool FreeInkDisplay::supportsStripGrayscale() const {
-  return grayscaleCapabilities().stripUploads;
-}
+bool FreeInkDisplay::supportsStripGrayscale() const { return grayscaleCapabilities().stripUploads; }
 
-bool FreeInkDisplay::combinesGrayscaleBase() const {
-  return grayscaleCapabilities().base == GrayscaleBase::Combined;
-}
+bool FreeInkDisplay::combinesGrayscaleBase() const { return grayscaleCapabilities().base == GrayscaleBase::Combined; }
 
 void FreeInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
   cancelGrayscalePass();
@@ -1043,6 +1102,7 @@ void FreeInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
 void FreeInkDisplay::cleanupGrayscaleWithPreviousBuffer() {
   cancelGrayscalePass();
+  syncPendingAsync();
   const uint8_t* baseline = frameBufferActive ? frameBufferActive : frameBuffer;
   if (!_inverted) {
     DisplayPmLock pmLock;
@@ -1070,7 +1130,7 @@ void FreeInkDisplay::abortPostRefresh() {
 
 bool FreeInkDisplay::postRefreshAborted() const { return _driver && _driver->postRefreshAborted(); }
 
-bool FreeInkDisplay::displayCommitted() const { return !_driver || _driver->displayCommitted(); }
+bool FreeInkDisplay::displayCommitted() const { return !_bus.hasFailed() && (!_driver || _driver->displayCommitted()); }
 
 void FreeInkDisplay::runMaintenance() {
   if (!_driver) return;
@@ -1126,7 +1186,9 @@ void FreeInkDisplay::deepSleep() {
   cancelGrayscalePass();
   DisplayPmLock pmLock;
   syncPendingAsync();
+  if (handleBusFailure()) return;
   if (_driver) _driver->deepSleep(_bus);
+  handleBusFailure();
 }
 
 // ============================================================================

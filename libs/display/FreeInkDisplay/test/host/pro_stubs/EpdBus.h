@@ -53,9 +53,10 @@ class EpdBus {
   void cmdData2(uint8_t c, uint8_t a, uint8_t b) { cmd(c); data(a); data(b); }
   void cmdData(uint8_t c, const uint8_t* p, uint16_t n) { cmd(c); data(p,n); }
   void reset(uint16_t=0) {}
-  void waitBusy(const char* =nullptr) { assert(!transaction); ++waits; }
-  void waitRefreshComplete(const char* =nullptr) { assert(!transaction); ++waits; }
+  bool waitBusy(const char* =nullptr) { assert(!transaction); ++waits; return true; }
+  bool waitRefreshComplete(const char* =nullptr) { assert(!transaction); ++waits; return true; }
   bool isBusy() const { return false; }
+  bool hasFailed() const { return false; }
   EpdPins pins() const { return {}; }
   void setBusyWaitHooks(void (*)(), void (*)()) {}
   void setBusyWaitSliceHook(bool (*)(int8_t,uint8_t)) {}

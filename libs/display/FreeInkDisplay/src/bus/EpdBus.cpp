@@ -84,6 +84,8 @@ EpdBus::Transaction::Transaction(EpdBus& bus) : _bus(&bus), _pmLock(bus), _activ
   SPI.beginTransaction(_bus->_spi);
 }
 
+bool EpdBus::Transaction::writable() const { return _active && _bus != nullptr && !_bus->_failed; }
+
 EpdBus::Transaction::~Transaction() { end(); }
 
 EpdBus::Transaction::Transaction(Transaction&& other) noexcept
@@ -114,20 +116,23 @@ void EpdBus::Transaction::end() {
   _active = false;
 }
 
-uint8_t EpdBus::Transaction::transfer(uint8_t d) { return SPI.transfer(d); }
+uint8_t EpdBus::Transaction::transfer(uint8_t d) { return writable() ? SPI.transfer(d) : 0; }
 
 void EpdBus::Transaction::cmd(uint8_t c) {
+  if (!writable()) return;
   digitalWrite(_bus->_pins.dc, LOW);
   SPI.transfer(c);
   digitalWrite(_bus->_pins.dc, HIGH);
 }
 
 void EpdBus::Transaction::data(uint8_t d) {
+  if (!writable()) return;
   digitalWrite(_bus->_pins.dc, HIGH);
   SPI.transfer(d);
 }
 
 void EpdBus::Transaction::writeBytes(const uint8_t* d, uint16_t len) {
+  if (!writable()) return;
   digitalWrite(_bus->_pins.dc, HIGH);
   SPI.writeBytes(d, len);
 }
@@ -209,6 +214,8 @@ void EpdBus::reset(uint16_t extraSettleMs) {
     if (_pins.rst >= 0) {
       digitalWrite(_pins.rst, HIGH);
     }
+    _failed = false;
+    if (_busy == BusyPolarity::ActiveHigh) waitBusy("reset idle");
     return;
   }
   const auto setReset = [this](bool high) {
@@ -227,11 +234,14 @@ void EpdBus::reset(uint16_t extraSettleMs) {
   if (extraSettleMs) {
     delay(extraSettleMs);
   }
+  _failed = false;
+  if (_busy == BusyPolarity::ActiveHigh) waitBusy("reset idle");
 }
 
 EpdBus::Transaction EpdBus::transaction() { return Transaction(*this); }
 
 EpdBus::Transaction EpdBus::beginTxn() {
+  if (_failed) return Transaction();
   if (_coCs >= 0) {
     digitalWrite(_coCs, HIGH);
   }
@@ -241,6 +251,7 @@ EpdBus::Transaction EpdBus::beginTxn() {
 }
 
 void EpdBus::cmd(uint8_t c) {
+  if (_failed) return;
   auto txn = transaction();
   digitalWrite(_pins.dc, LOW);
   digitalWrite(_pins.cs, LOW);
@@ -248,6 +259,7 @@ void EpdBus::cmd(uint8_t c) {
 }
 
 void EpdBus::data(uint8_t d) {
+  if (_failed) return;
   auto txn = transaction();
   digitalWrite(_pins.dc, HIGH);
   digitalWrite(_pins.cs, LOW);
@@ -255,6 +267,7 @@ void EpdBus::data(uint8_t d) {
 }
 
 void EpdBus::data(const uint8_t* d, uint16_t len) {
+  if (_failed) return;
   auto txn = transaction();
   digitalWrite(_pins.dc, HIGH);
   digitalWrite(_pins.cs, LOW);
@@ -262,6 +275,7 @@ void EpdBus::data(const uint8_t* d, uint16_t len) {
 }
 
 void EpdBus::cmdData(uint8_t c, const uint8_t* d, uint16_t len) {
+  if (_failed) return;
   auto txn = transaction();
   digitalWrite(_pins.cs, LOW);
   digitalWrite(_pins.dc, LOW);
@@ -292,9 +306,10 @@ void EpdBus::createPmLocks() {
 #endif
 }
 
-void EpdBus::waitBusy(const char* tag) { waitBusy(_busy, tag); }
+bool EpdBus::waitBusy(const char* tag) { return waitBusy(_busy, tag); }
 
-void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
+bool EpdBus::waitBusy(BusyPolarity p, const char* tag) {
+  if (_failed) return false;
   const unsigned long start = millis();
   // Both hooks engage lazily, only once the wait has proven long (see
   // setBusyWaitHooks). longWait gates the slice hook independently of the
@@ -378,20 +393,27 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   }
 
   if (hookFired && _busyWaitEndHook != nullptr) _busyWaitEndHook();
-  if (p == BusyPolarity::X3TwoPhase && !x3SawLow) return;
-
-  if (tag && Serial) {
-    Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), tag, millis() - start);
-  }
+  if (p == BusyPolarity::X3TwoPhase && !x3SawLow) return true;
+  const bool complete = digitalRead(_pins.busy) == (p == BusyPolarity::ActiveHigh ? LOW : HIGH);
+  return finishWait(complete, tag, start);
 }
 
-void EpdBus::waitRefreshComplete(const char* tag) {
+bool EpdBus::finishWait(bool complete, const char* tag, unsigned long start) {
+  if (!complete) _failed = true;
+  if (Serial && (!complete || tag)) {
+    Serial.printf("[%lu]   Wait %s: %s (%lu ms)\n", millis(), complete ? "complete" : "FAILED", tag ? tag : "BUSY",
+                  millis() - start);
+  }
+  return complete;
+}
+
+bool EpdBus::waitRefreshComplete(const char* tag) {
+  if (_failed) return false;
   // The X4 Pro UC production wait is level-based, not edge-qualified. Keep the
   // same one-tick/idle-HIGH rule for refresh completion so a missed assertion
   // edge can never make the caller write RAM while the waveform is still busy.
   if (_busy == BusyPolarity::UcIdleHigh) {
-    waitBusy(_busy, tag);
-    return;
+    return waitBusy(_busy, tag);
   }
   // A host that installed a busy-wait slice hook (e.g. CrossPoint light-sleeping
   // through the refresh) must keep the polling path: waitBusy() invokes the slice
@@ -402,7 +424,7 @@ void EpdBus::waitRefreshComplete(const char* tag) {
   // host is slept would be missed and the wait would stall to its 30 s timeout. The
   // slice hook already delivers GPIO-precise wake, so the ISR path buys these hosts
   // nothing — fall back to the hooked poll.
-  if (_busyWaitSliceHook != nullptr) {
+  if (_busyWaitSliceHook != nullptr || !s_epdRefreshDone) {
     // Refresh-completion context: BUSY assertion can trail MASTER_ACTIVATION
     // by a few microseconds, and the ActiveHigh polled path (unlike ActiveLow's
     // 100 ms grace loop, or the ISR path's 20 ms edge wait below) would fall
@@ -417,15 +439,7 @@ void EpdBus::waitRefreshComplete(const char* tag) {
         delayMicroseconds(200);
       }
     }
-    waitBusy(tag);
-    return;
-  }
-  // ISR-driven completion wait: sleep the task on a semaphore and wake on the
-  // exact BUSY completion edge, instead of polling every 1 ms. Falls back to
-  // polling if the semaphore could not be created.
-  if (!s_epdRefreshDone) {
-    waitBusy(tag);
-    return;
+    return waitBusy(tag);
   }
   // Levels by polarity. CHANGE is armed so both the delayed BUSY assertion and
   // its completion are event-driven; the task never polls during either phase.
@@ -442,14 +456,11 @@ void EpdBus::waitRefreshComplete(const char* tag) {
     // BUSY assertion can trail MASTER_ACTIVATION by a few microseconds. Sleep
     // until an edge instead of delay(1) polling. No edge in 20 ms means the
     // command was a no-op or its entire pulse completed before we armed.
-    if (xSemaphoreTake(s_epdRefreshDone, pdMS_TO_TICKS(20)) != pdTRUE) {
-      detachInterrupt(digitalPinToInterrupt(_pins.busy));
-      return;
-    }
+    xSemaphoreTake(s_epdRefreshDone, pdMS_TO_TICKS(20));
     sawWorking = digitalRead(_pins.busy) == workingLevel;
     if (!sawWorking && digitalRead(_pins.busy) == doneLevel) {
       detachInterrupt(digitalPinToInterrupt(_pins.busy));
-      return;
+      return true;
     }
   }
 
@@ -457,14 +468,14 @@ void EpdBus::waitRefreshComplete(const char* tag) {
   const bool hook = (_busyWaitBeginHook != nullptr);
   if (hook) _busyWaitBeginHook();
   while (digitalRead(_pins.busy) != doneLevel) {
-    if (xSemaphoreTake(s_epdRefreshDone, pdMS_TO_TICKS(30000)) != pdTRUE) break;
+    const unsigned long elapsed = millis() - start;
+    if (elapsed >= 30000) break;
+    if (xSemaphoreTake(s_epdRefreshDone, pdMS_TO_TICKS(30000 - elapsed)) != pdTRUE) break;
   }
   if (hook && _busyWaitEndHook != nullptr) _busyWaitEndHook();
 
   detachInterrupt(digitalPinToInterrupt(_pins.busy));
-  if (tag && Serial) {
-    Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), tag, millis() - start);
-  }
+  return finishWait(digitalRead(_pins.busy) == doneLevel, tag, start);
 }
 
 void EpdBus::sendPlaneFlipped(uint8_t ramCmd, const uint8_t* plane, uint16_t height, uint16_t widthBytes) {
@@ -475,8 +486,7 @@ void EpdBus::sendPlaneFlipped(uint8_t ramCmd, const uint8_t* plane, uint16_t hei
   }
 }
 
-void EpdBus::sendPlaneFlippedInverted(uint8_t ramCmd, const uint8_t* plane, uint16_t height,
-                                      uint16_t widthBytes) {
+void EpdBus::sendPlaneFlippedInverted(uint8_t ramCmd, const uint8_t* plane, uint16_t height, uint16_t widthBytes) {
   // Streams ~plane[i] row-reversed without a host-side copy of the inverted
   // frame (the C3 boards have no RAM to spare for one). Same single CS-low
   // burst contract as sendPlaneFlipped().

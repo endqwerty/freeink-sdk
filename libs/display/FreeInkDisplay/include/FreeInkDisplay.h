@@ -128,6 +128,7 @@ class FreeInkDisplay {
   void displayGrayscaleBase(RefreshMode fallback = HALF_REFRESH, bool turnOffScreen = false);
   // Starts a mode-bound pass. Absolute uploads must cover both complete planes
   // (full buffers or consecutive strips per plane) before displayGrayBuffer().
+  // Direct with FULL_REFRESH paints a full B/W cleanup before the Direct pass.
   // False means the requested mode is unavailable; no base was painted.
   bool displayGrayscaleBase(GrayscaleMode mode, RefreshMode fallback = HALF_REFRESH, bool turnOffScreen = false);
   void copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer);
@@ -400,6 +401,8 @@ class FreeInkDisplay {
   // Block until a pending async refresh completes (no-op when none is).
   // Every blocking panel operation calls this before touching the bus.
   void syncPendingAsync();
+  bool handleBusFailure();
+  bool prepareDisplay();
   // Shared body of displayBufferAsync() / triggerDisplayAsync(): fire the
   // update and return while the waveform runs (_asyncPending set).
   void displayAsyncImpl(RefreshMode mode, bool turnOffScreen, bool noShadow = false);
